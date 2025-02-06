@@ -1,0 +1,5 @@
+Flask
+boxsdk
+slack_sdk  # If you're using the Slack SDK
+python-dotenv # For local environment variables
+gunicorn # For Heroku deployment
