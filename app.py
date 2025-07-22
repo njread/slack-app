@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests
 import slack_sdk
@@ -54,7 +55,7 @@ BOX_DEV_TOKEN = os.environ.get("BOX_DEV_TOKEN")
 BOX_HUB_ID = os.environ.get("BOX_HUB_ID")
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
-BOX_DEV_TOKEN = 'YOUR_BOX_DEV_TOKEN'
+
 # Initialize Slack clients
 web_client = WebClient(token=SLACK_BOT_TOKEN)
 socket_mode_client = SocketModeClient(
@@ -62,14 +63,154 @@ socket_mode_client = SocketModeClient(
     web_client=web_client
 )
 
+def get_last_week_timestamp():
+    """Get timestamp for one week ago"""
+    one_week_ago = datetime.now() - timedelta(days=7)
+    return one_week_ago.timestamp()
+
+def fetch_messages_from_last_week(channel_id, limit=100):
+    """Fetch messages from the last week for a specific channel"""
+    try:
+        oldest_timestamp = get_last_week_timestamp()
+        
+        logger.info(f"Fetching messages from channel {channel_id} since {datetime.fromtimestamp(oldest_timestamp)}")
+        
+        messages = []
+        cursor = None
+        
+        while True:
+            # Fetch conversation history
+            response = web_client.conversations_history(
+                channel=channel_id,
+                oldest=str(oldest_timestamp),
+                limit=limit,
+                cursor=cursor
+            )
+            
+            batch_messages = response.get("messages", [])
+            messages.extend(batch_messages)
+            
+            logger.debug(f"Fetched {len(batch_messages)} messages in this batch")
+            
+            # Check if there are more messages
+            if not response.get("has_more", False):
+                break
+                
+            cursor = response.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+        
+        # Filter out bot messages and messages with subtypes (like file uploads, etc.)
+        filtered_messages = [
+            msg for msg in messages 
+            if not msg.get("bot_id") and not msg.get("subtype") and msg.get("text")
+        ]
+        
+        logger.info(f"Found {len(filtered_messages)} user messages from the last week")
+        return filtered_messages
+        
+    except Exception as e:
+        logger.error(f"Error fetching messages from last week: {str(e)}")
+        return []
+
+def get_all_channels():
+    """Get list of all channels the bot has access to"""
+    try:
+        channels = []
+        cursor = None
+        
+        while True:
+            response = web_client.conversations_list(
+                types="public_channel,private_channel",
+                cursor=cursor,
+                limit=100
+            )
+            
+            batch_channels = response.get("channels", [])
+            # Filter for channels the bot is a member of
+            member_channels = [ch for ch in batch_channels if ch.get("is_member", False)]
+            channels.extend(member_channels)
+            
+            if not response.get("has_more", False):
+                break
+                
+            cursor = response.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+        
+        logger.info(f"Found {len(channels)} channels where bot is a member")
+        return channels
+        
+    except Exception as e:
+        logger.error(f"Error fetching channels: {str(e)}")
+        return []
+
+def process_weekly_messages():
+    """Process all messages from the last week across all channels"""
+    try:
+        logger.info("Starting weekly message processing...")
+        
+        channels = get_all_channels()
+        all_messages = []
+        
+        for channel in channels:
+            channel_id = channel["id"]
+            channel_name = channel["name"]
+            
+            logger.info(f"Processing channel: #{channel_name} ({channel_id})")
+            messages = fetch_messages_from_last_week(channel_id)
+            
+            # Add channel context to messages
+            for msg in messages:
+                msg["channel_name"] = channel_name
+                msg["channel_id"] = channel_id
+            
+            all_messages.extend(messages)
+        
+        logger.info(f"Total messages collected from last week: {len(all_messages)}")
+        
+        # Process messages with Box AI (you can customize this logic)
+        if all_messages:
+            process_messages_with_box_ai(all_messages)
+        
+        return all_messages
+        
+    except Exception as e:
+        logger.error(f"Error in weekly message processing: {str(e)}")
+        return []
+
+def process_messages_with_box_ai(messages):
+    """Process messages with Box AI - customize this based on your needs"""
+    try:
+        # Example: Create a summary of all messages
+        message_texts = [f"From #{msg['channel_name']}: {msg['text']}" for msg in messages]
+        combined_text = "\n".join(message_texts[:50])  # Limit to first 50 messages
+        
+        prompt = f"Please summarize the key topics and themes from these Slack messages from the past week:\n\n{combined_text}"
+        
+        logger.info("Sending weekly summary request to Box AI...")
+        summary = query_box_ai(prompt)
+        
+        # You could post this summary to a specific channel
+        # web_client.chat_postMessage(
+        #     channel="C1234567890",  # Replace with your summary channel ID
+        #     text=f"📊 Weekly Activity Summary:\n{summary}"
+        # )
+        
+        logger.info("Weekly summary generated successfully")
+        return summary
+        
+    except Exception as e:
+        logger.error(f"Error processing messages with Box AI: {str(e)}")
+        return None
+
 def query_box_ai(prompt):
     """Query Box AI with the given prompt"""
     logger.debug(f"Querying Box AI with prompt: {prompt}")
     
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer ********",
-        "Cookie": "csrf-token=*******"
+        "Authorization": f"Bearer {BOX_DEV_TOKEN}",
     }
     
     payload = {
@@ -77,44 +218,24 @@ def query_box_ai(prompt):
         "items": [
             {
                 "type": "hubs",
-                "id": "129786028"
+                "id": BOX_HUB_ID
             }
         ],
         "prompt": prompt,
         "includes_citations": "True"
     }
     
-    logger.debug("=== Box API Request Details ===")
-    logger.debug(f"URL: {BOX_API_URL}")
-    logger.debug("Headers:")
-    for key, value in headers.items():
-        if key == "Authorization":
-            logger.debug(f"  {key}: Bearer [last 4 digits: {value[-4:]}]")
-        else:
-            logger.debug(f"  {key}: {value}")
-    logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
-    
     response = requests.post(BOX_API_URL, headers=headers, json=payload)
-    
-    logger.debug("=== Box API Response Details ===")
-    logger.debug(f"Status Code: {response.status_code}")
-    logger.debug("Response Headers:")
-    for key, value in response.headers.items():
-        logger.debug(f"  {key}: {value}")
-    logger.debug(f"Response Body: {response.text}")
-    
     response.raise_for_status()
     return response.json().get("answer")
 
 def check_thread_replies(client, channel, thread_ts):
     """Check if thread has any replies"""
     try:
-        # Get thread replies
         response = client.web_client.conversations_replies(
             channel=channel,
             ts=thread_ts
         )
-        # Check if there are more than 1 message (original + replies)
         return len(response["messages"]) > 1
     except Exception as e:
         logger.error(f"Error checking thread replies: {str(e)}")
@@ -123,15 +244,12 @@ def check_thread_replies(client, channel, thread_ts):
 def delayed_box_response(client, channel, text, thread_ts):
     """Function to execute after delay"""
     try:
-        # Check if anyone has replied in the thread
         if check_thread_replies(client, channel, thread_ts):
             logger.info(f"Thread {thread_ts} already has replies, skipping Box AI response")
             return
 
-        # Query Box AI
         answer = query_box_ai(text)
         
-        # Send response in thread
         client.web_client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
@@ -144,9 +262,7 @@ def process_slack_event(client: SocketModeClient, req: SocketModeRequest):
     """Process incoming Slack events"""
     try:
         logger.debug(f"Received event type: {req.type}")
-        logger.debug(f"Full request payload: {json.dumps(req.payload, indent=2)}")
         
-        # Acknowledge the event immediately
         ack = SocketModeResponse(envelope_id=req.envelope_id)
         client.send_socket_mode_response(ack)
         
@@ -155,21 +271,13 @@ def process_slack_event(client: SocketModeClient, req: SocketModeRequest):
             event_type = event.get("type")
             
             if event_type == "message":
-                # Skip if message is from a bot or has certain subtypes
-                if event.get("bot_id") or event.get("subtype"):
-                    return
-
-                # Skip if message is already in a thread
-                if event.get("thread_ts"):
+                if event.get("bot_id") or event.get("subtype") or event.get("thread_ts"):
                     return
                 
                 text = event.get("text", "")
                 channel = event.get("channel")
-                message_ts = event.get("ts")  # This will be the thread_ts for replies
+                message_ts = event.get("ts")
                 
-                logger.debug(f"Message received: {text} in channel: {channel}")
-                
-                # Add thinking reaction
                 try:
                     client.web_client.reactions_add(
                         channel=channel,
@@ -179,16 +287,15 @@ def process_slack_event(client: SocketModeClient, req: SocketModeRequest):
                 except Exception as e:
                     logger.error(f"Error adding reaction: {str(e)}")
                 
-                # Schedule delayed response
-                timer = Timer(
-                    1.0,  # 30 second delay
-                    delayed_box_response,
-                    args=[client, channel, text, message_ts]
-                )
+                timer = Timer(1.0, delayed_box_response, args=[client, channel, text, message_ts])
                 timer.start()
                 
-        elif req.type == "slash_commands" and req.payload.get("command") == "/askboxhub":
-            handle_slash_command(client, req)
+        elif req.type == "slash_commands":
+            command = req.payload.get("command")
+            if command == "/askboxhub":
+                handle_slash_command(client, req)
+            elif command == "/weekly_summary":
+                handle_weekly_summary_command(client, req)
             
     except Exception as e:
         logger.error(f"Error processing event: {str(e)}", exc_info=True)
@@ -208,10 +315,8 @@ def handle_slash_command(client, req):
             )
             return
 
-        # Query Box AI
         answer = query_box_ai(prompt)
         
-        # Send response
         client.web_client.chat_postMessage(
             channel=channel_id,
             text=f"*Question:* {prompt}\n*Answer:* {answer}"
@@ -219,11 +324,44 @@ def handle_slash_command(client, req):
         
     except Exception as e:
         logger.error(f"Error processing slash command: {str(e)}", exc_info=True)
+
+def handle_weekly_summary_command(client, req):
+    """Handle the /weekly_summary slash command"""
+    try:
+        channel_id = req.payload.get("channel_id")
+        user_id = req.payload.get("user_id")
+        
+        # Send immediate response
         client.web_client.chat_postEphemeral(
             channel=channel_id,
             user=user_id,
-            text=f"An error occurred: {str(e)}"
+            text="⏳ Generating weekly summary... This may take a moment."
         )
+        
+        # Process weekly messages in background
+        def process_in_background():
+            try:
+                summary = process_weekly_messages()
+                if summary:
+                    client.web_client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"📊 *Weekly Activity Summary*\n{summary}"
+                    )
+                else:
+                    client.web_client.chat_postMessage(
+                        channel=channel_id,
+                        text="❌ Unable to generate weekly summary. Please check the logs."
+                    )
+            except Exception as e:
+                logger.error(f"Error in background processing: {str(e)}")
+        
+        # Start background processing
+        thread = Thread(target=process_in_background)
+        thread.daemon = True
+        thread.start()
+        
+    except Exception as e:
+        logger.error(f"Error processing weekly summary command: {str(e)}", exc_info=True)
 
 # Register the event handler
 socket_mode_client.socket_mode_request_listeners.append(process_slack_event)
@@ -231,6 +369,20 @@ socket_mode_client.socket_mode_request_listeners.append(process_slack_event)
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"})
+
+@app.route('/weekly_summary', methods=['POST'])
+def weekly_summary_endpoint():
+    """HTTP endpoint to trigger weekly summary"""
+    try:
+        messages = process_weekly_messages()
+        return jsonify({
+            "status": "success",
+            "message_count": len(messages),
+            "summary": "Weekly processing completed"
+        })
+    except Exception as e:
+        logger.error(f"Error in weekly summary endpoint: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 def run_flask():
     port = int(os.environ.get("PORT", 3000))
@@ -240,27 +392,20 @@ if __name__ == "__main__":
     try:
         logger.info("Starting Box AI Assistant...")
         
-        # Validate configuration before starting
         validate_config()
         logger.debug("Configuration validated successfully")
         
-        # Test Slack connection
-        logger.debug("Testing Slack connection...")
         auth_test = web_client.auth_test()
         logger.debug(f"Connected to Slack as: {auth_test['bot_id']}")
         
-        # Start Flask in a separate thread
         flask_thread = Thread(target=run_flask)
         flask_thread.daemon = True
         flask_thread.start()
         
-        # Start Socket Mode client
         logger.info("Connecting to Slack...")
         socket_mode_client.connect()
         
-        # Keep the main thread running
         while True:
-            import time
             time.sleep(1)
             
     except ValueError as e:
